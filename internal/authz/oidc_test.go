@@ -2466,3 +2466,88 @@ func TestSetCookieHeaderNeverPairsHostPrefixWithDomain(t *testing.T) {
 	require.NotContains(t, header, "__Host-")
 	require.Contains(t, header, "__Secure-")
 }
+
+// A browser tab left open on a protected app keeps making background requests
+// (XHR polling, websockets) after the session's tokens expire. Each of those
+// used to go through redirectToIDP, which REMOVES the current session and sets
+// a brand-new session cookie. So while the user was away at the IdP completing
+// a login, every background poll destroyed the session holding that login's
+// state and rotated the cookie underneath them. The callback then always
+// arrived with a cookie whose stored state did not match, and was denied:
+//
+//	state from request does not match state from store
+//
+// Only a top-level navigation may start a login. Background requests get a
+// plain 401 and must leave the session store and the cookie alone.
+func TestBackgroundRequestsDoNotDestroyPendingLogin(t *testing.T) {
+	requestWithFetchMode := func(mode string) *envoy.CheckRequest {
+		req := proto.Clone(withSessionHeader).(*envoy.CheckRequest)
+		if mode != "" {
+			req.GetAttributes().GetRequest().GetHttp().GetHeaders()["sec-fetch-mode"] = mode
+		}
+		return req
+	}
+
+	tests := []struct {
+		name           string
+		fetchMode      string
+		wantLoginStart bool
+	}{
+		// Background requests: must not touch the pending login.
+		{name: "xhr / fetch", fetchMode: "cors", wantLoginStart: false},
+		{name: "same-origin fetch", fetchMode: "same-origin", wantLoginStart: false},
+		{name: "no-cors subresource", fetchMode: "no-cors", wantLoginStart: false},
+		{name: "websocket", fetchMode: "websocket", wantLoginStart: false},
+		// Navigations, and clients that send no fetch metadata at all (curl,
+		// older browsers), keep the original behaviour exactly.
+		{name: "top-level navigation", fetchMode: "navigate", wantLoginStart: true},
+		{name: "no fetch metadata", fetchMode: "", wantLoginStart: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clock := oidc.Clock{}
+			sessions := &mockSessionStoreFactory{store: oidc.NewMemoryStore(&clock, time.Hour, time.Hour)}
+			store := sessions.Get(basicOIDCConfig)
+			tlsPool := inthttp.NewTLSConfigPool(noopWatcher{})
+			h, err := NewOIDCHandler(basicOIDCConfig, tlsPool,
+				oidc.NewJWKSProvider(newConfigFor(basicOIDCConfig), tlsPool), sessions, clock,
+				oidc.NewStaticGenerator(newSessionID, newNonce, newState, newCodeVerifier))
+			require.NoError(t, err)
+
+			ctx := t.Context()
+			// A login is in flight on this session: authorization state stored,
+			// no tokens yet.
+			require.NoError(t, store.SetAuthorizationState(ctx, sessionID, validAuthState))
+
+			resp := &envoy.CheckResponse{}
+			require.NoError(t, h.Process(ctx, requestWithFetchMode(tt.fetchMode), resp))
+			requireStatus(t, codes.Unauthenticated, resp)
+
+			var location, setCookie string
+			for _, hdr := range resp.GetDeniedResponse().GetHeaders() {
+				switch hdr.GetHeader().GetKey() {
+				case inthttp.HeaderLocation:
+					location = hdr.GetHeader().GetValue()
+				case inthttp.HeaderSetCookie:
+					setCookie = hdr.GetHeader().GetValue()
+				}
+			}
+
+			if tt.wantLoginStart {
+				require.Equal(t, typev3.StatusCode_Found, resp.GetDeniedResponse().GetStatus().GetCode())
+				require.NotEmpty(t, location, "a navigation must be redirected to the IdP")
+				requireCookie(t, resp.GetDeniedResponse())
+				requireStoredState(t, store, newSessionID, true)
+				requireStoredState(t, store, sessionID, false) // anti-fixation rotation kept
+				return
+			}
+
+			require.Equal(t, typev3.StatusCode_Unauthorized, resp.GetDeniedResponse().GetStatus().GetCode())
+			require.Empty(t, location, "a background request must not start a login")
+			require.Empty(t, setCookie, "a background request must not rotate the session cookie")
+			requireStoredState(t, store, sessionID, true)     // the pending login survives
+			requireStoredState(t, store, newSessionID, false) // and nothing new was minted
+		})
+	}
+}

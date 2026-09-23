@@ -233,6 +233,25 @@ func (o *oidcHandler) Process(ctx context.Context, req *envoy.CheckRequest, resp
 func (o *oidcHandler) redirectToIDP(ctx context.Context, log telemetry.Logger,
 	resp *envoy.CheckResponse, httpRequest *envoy.AttributeContext_HttpRequest, oldSessionID string) {
 
+	// Only a top-level navigation may start a login.
+	//
+	// Starting one removes the current session and sets a new session cookie
+	// (the anti-fixation rotation below). When that ran for background requests
+	// too, a tab left open on a protected app - XHR polling, websocket
+	// reconnects - destroyed the session holding an in-flight login every few
+	// seconds and rotated the cookie underneath the user while they were at the
+	// IdP. The callback then always arrived with a cookie whose stored state did
+	// not match, and was denied. Background requests now get a plain 401 and
+	// leave the session and cookie alone; the app's own 401 handling turns that
+	// into a navigation, which starts the login properly.
+	if isBackgroundRequest(httpRequest) {
+		log.Info("background request has no valid tokens. Denying without starting a login so any login in flight survives")
+		deny := newDenyResponse()
+		deny.Status = &typev3.HttpStatus{Code: typev3.StatusCode_Unauthorized}
+		setDenyResponse(resp, deny, codes.Unauthenticated)
+		return
+	}
+
 	store := o.sessions.Get(o.config)
 	if oldSessionID != "" {
 		// remove old session and regenerate session_id to prevent session fixation attacks
@@ -776,6 +795,18 @@ func setRedirect(deny *envoy.DeniedHttpResponse, location string) {
 	deny.Headers = append(deny.Headers, &corev3.HeaderValueOption{
 		Header: &corev3.HeaderValue{Key: inthttp.HeaderLocation, Value: location},
 	})
+}
+
+// isBackgroundRequest reports whether the browser marked this request as
+// something other than a top-level navigation, using the Sec-Fetch-Mode fetch
+// metadata header that every current browser sends on every request.
+//
+// Absence is treated as a navigation on purpose: curl, older browsers and
+// non-browser clients send no fetch metadata, and they must keep the original
+// redirect-to-login behaviour rather than silently getting a 401.
+func isBackgroundRequest(httpRequest *envoy.AttributeContext_HttpRequest) bool {
+	mode, ok := httpRequest.GetHeaders()["sec-fetch-mode"]
+	return ok && mode != "" && mode != "navigate"
 }
 
 // setSetCookieHeader populates the DeniedHttpResponse with the given cookie.
