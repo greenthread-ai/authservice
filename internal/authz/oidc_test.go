@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -2550,4 +2551,87 @@ func TestBackgroundRequestsDoNotDestroyPendingLogin(t *testing.T) {
 			requireStoredState(t, store, newSessionID, false) // and nothing new was minted
 		})
 	}
+}
+
+// Some IdPs only behave usefully with extra authorization-request parameters.
+// Google is the motivating case: it issues a refresh token only when asked for
+// access_type=offline (and reliably only with prompt=consent). Without one, a
+// session dies when its one-hour ID token expires and every user is sent back
+// through a full login every hour.
+//
+// The natural place to configure them is on authorization_uri itself. That used
+// to produce a broken URL - the standard params were appended with a second "?"
+// - so the parameters already on the URI must be kept and merged.
+func TestAuthorizationURIKeepsExistingQueryParams(t *testing.T) {
+	cfg := proto.Clone(basicOIDCConfig).(*oidcv1.OIDCConfig)
+	cfg.AuthorizationUri = "http://idp-test-server/auth?access_type=offline&prompt=consent"
+
+	clock := oidc.Clock{}
+	sessions := &mockSessionStoreFactory{store: oidc.NewMemoryStore(&clock, time.Hour, time.Hour)}
+	tlsPool := inthttp.NewTLSConfigPool(noopWatcher{})
+	h, err := NewOIDCHandler(cfg, tlsPool,
+		oidc.NewJWKSProvider(newConfigFor(cfg), tlsPool), sessions, clock,
+		oidc.NewStaticGenerator(newSessionID, newNonce, newState, newCodeVerifier))
+	require.NoError(t, err)
+
+	resp := &envoy.CheckResponse{}
+	require.NoError(t, h.Process(t.Context(), withNoSessionHeader(), resp))
+
+	var location string
+	for _, hdr := range resp.GetDeniedResponse().GetHeaders() {
+		if hdr.GetHeader().GetKey() == inthttp.HeaderLocation {
+			location = hdr.GetHeader().GetValue()
+		}
+	}
+	require.Equal(t, 1, strings.Count(location, "?"), "exactly one query separator: %s", location)
+
+	u, err := url.Parse(location)
+	require.NoError(t, err)
+	require.Equal(t, "http://idp-test-server/auth", u.Scheme+"://"+u.Host+u.Path)
+	q := u.Query()
+	// The configured extras survive...
+	require.Equal(t, "offline", q.Get("access_type"))
+	require.Equal(t, "consent", q.Get("prompt"))
+	// ...alongside the standard ones, unchanged.
+	require.Equal(t, "code", q.Get("response_type"))
+	require.Equal(t, "test-client-id", q.Get("client_id"))
+	require.Equal(t, newState, q.Get("state"))
+	require.Equal(t, newNonce, q.Get("nonce"))
+	require.Equal(t, "S256", q.Get("code_challenge_method"))
+}
+
+// The standard params are authoritative: a configured URI must not be able to
+// override the ones that carry the security of the flow.
+func TestAuthorizationURIStandardParamsWin(t *testing.T) {
+	cfg := proto.Clone(basicOIDCConfig).(*oidcv1.OIDCConfig)
+	cfg.AuthorizationUri = "http://idp-test-server/auth?state=attacker&client_id=other&access_type=offline"
+
+	clock := oidc.Clock{}
+	sessions := &mockSessionStoreFactory{store: oidc.NewMemoryStore(&clock, time.Hour, time.Hour)}
+	tlsPool := inthttp.NewTLSConfigPool(noopWatcher{})
+	h, err := NewOIDCHandler(cfg, tlsPool,
+		oidc.NewJWKSProvider(newConfigFor(cfg), tlsPool), sessions, clock,
+		oidc.NewStaticGenerator(newSessionID, newNonce, newState, newCodeVerifier))
+	require.NoError(t, err)
+
+	resp := &envoy.CheckResponse{}
+	require.NoError(t, h.Process(t.Context(), withNoSessionHeader(), resp))
+	var location string
+	for _, hdr := range resp.GetDeniedResponse().GetHeaders() {
+		if hdr.GetHeader().GetKey() == inthttp.HeaderLocation {
+			location = hdr.GetHeader().GetValue()
+		}
+	}
+	u, err := url.Parse(location)
+	require.NoError(t, err)
+	q := u.Query()
+	require.Equal(t, []string{newState}, q["state"], "state must be ours, and only ours")
+	require.Equal(t, []string{"test-client-id"}, q["client_id"])
+	require.Equal(t, "offline", q.Get("access_type"))
+}
+
+func withNoSessionHeader() *envoy.CheckRequest {
+	req := proto.Clone(withSessionHeader).(*envoy.CheckRequest)
+	delete(req.GetAttributes().GetRequest().GetHttp().GetHeaders(), inthttp.HeaderCookie)
+	return req
 }

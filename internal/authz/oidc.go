@@ -285,18 +285,31 @@ func (o *oidcHandler) redirectToIDP(ctx context.Context, log telemetry.Logger,
 		return
 	}
 
-	// Generate the redirect URL
-	query := url.Values{
-		"response_type":         []string{"code"},
-		"client_id":             []string{o.config.GetClientId()},
-		"redirect_uri":          []string{o.config.GetCallbackUri()},
-		"scope":                 []string{strings.Join(o.config.GetScopes(), " ")},
-		"state":                 []string{state},
-		"nonce":                 []string{nonce},
-		"code_challenge":        []string{oauth2.S256ChallengeFromVerifier(codeVerifier)},
-		"code_challenge_method": []string{"S256"},
+	// Generate the redirect URL.
+	//
+	// Query parameters already present on the configured authorization_uri are
+	// kept and merged. That is how IdP-specific extras are configured - Google
+	// only issues a refresh token for access_type=offline, without which every
+	// session dies with its one-hour ID token. The standard parameters below are
+	// set last with Set, so they always win: a configured URI cannot override
+	// state, nonce, client_id or the PKCE challenge.
+	authURL, err := url.Parse(o.config.GetAuthorizationUri())
+	if err != nil {
+		log.Error("invalid authorization_uri", err)
+		setDenyResponse(resp, newSessionErrorResponse(), codes.Unauthenticated)
+		return
 	}
-	redirectURL := o.config.GetAuthorizationUri() + "?" + query.Encode()
+	query := authURL.Query()
+	query.Set("response_type", "code")
+	query.Set("client_id", o.config.GetClientId())
+	query.Set("redirect_uri", o.config.GetCallbackUri())
+	query.Set("scope", strings.Join(o.config.GetScopes(), " "))
+	query.Set("state", state)
+	query.Set("nonce", nonce)
+	query.Set("code_challenge", oauth2.S256ChallengeFromVerifier(codeVerifier))
+	query.Set("code_challenge_method", "S256")
+	authURL.RawQuery = query.Encode()
+	redirectURL := authURL.String()
 
 	// Generate denied response with redirect headers
 	deny := newDenyResponse()
